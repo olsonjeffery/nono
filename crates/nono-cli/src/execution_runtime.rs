@@ -774,6 +774,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         #[cfg(target_os = "linux")]
         namespaces,
         allowed_env_vars: flags.allowed_env_vars,
+        allow_inherit_fds: flags.allow_inherit_fds.clone(),
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),

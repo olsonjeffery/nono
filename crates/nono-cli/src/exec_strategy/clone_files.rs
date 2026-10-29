@@ -57,6 +57,10 @@ pub(super) struct Command<'a> {
     pub supervisor_fd: Option<RawFd>,
     pub pty_slave: Option<RawFd>,
     pub resource_procs: Option<RawFd>,
+    /// Parent-provided descriptors that survive the pre-exec sweep. The child
+    /// closes everything else above stdio; these stay in the keep-set and
+    /// have close-on-exec cleared before execve.
+    pub inherited_fds: &'a [RawFd],
     #[cfg(test)]
     pub fault: Fault,
 }
@@ -624,11 +628,23 @@ fn child_exec(
             die(126);
         }
     }
-    if !scrub_fds(cleanup_dir, command.supervisor_fd) {
+    if !scrub_fds(cleanup_dir, command.supervisor_fd, command.inherited_fds) {
         die(126);
     }
     if let Some(fd) = command.supervisor_fd {
         // SAFETY: the sole intentionally inherited non-stdio descriptor.
+        if unsafe { libc::syscall(libc::SYS_fcntl, fd, libc::F_SETFD, 0) } < 0 {
+            die(126);
+        }
+    }
+    for fd in command.inherited_fds {
+        // SAFETY: scalar syscall; the number was explicitly opted in and must
+        // survive execve, including when the parent set close-on-exec on it.
+        if unsafe { libc::syscall(libc::SYS_fcntl, fd, libc::F_GETFD) } < 0 {
+            // The descriptor vanished after validation; an absent descriptor
+            // cannot leak, so absence is not an error here.
+            continue;
+        }
         if unsafe { libc::syscall(libc::SYS_fcntl, fd, libc::F_SETFD, 0) } < 0 {
             die(126);
         }
@@ -691,7 +707,11 @@ fn setup_pty(slave: RawFd) -> bool {
 /// Enumerate the child's live table, not the parent's startup snapshot. The
 /// directory was opened by the parent using /proc/CHILD/fd before openat was
 /// trapped. It continues to refer to the child after the table detaches.
-fn scrub_fds(directory: RawFd, keep: Option<RawFd>) -> bool {
+///
+/// `keep` is nono's own plumbing (the supervisor notification socket);
+/// `inherited` lists parent-provided descriptors that `--allow-inherit-fd`
+/// opted into. Both survive the sweep; nothing else above stdio does.
+fn scrub_fds(directory: RawFd, keep: Option<RawFd>, inherited: &[RawFd]) -> bool {
     let mut buffer = [0_u8; 4096];
     loop {
         // SAFETY: initialized stack buffer, private descriptor table. Linux's
@@ -750,6 +770,7 @@ fn scrub_fds(directory: RawFd, keep: Option<RawFd>) -> bool {
                 && fd >= 3
                 && fd != directory
                 && Some(fd) != keep
+                && !inherited.contains(&fd)
             {
                 // SAFETY: this entry belongs to our private table, and no
                 // thread or signal handler can create/reuse slots here.

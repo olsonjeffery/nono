@@ -1272,6 +1272,21 @@ The flag adds to any `linux.isolate` set by the profile and cannot remove it. Su
 
 ### Operational Flags
 
+#### `--allow-inherit-fd`
+
+Pass a parent-provided file descriptor through to the supervised command. By default `nono run` closes every descriptor above stdio (0/1/2) in the sandboxed child, so an agent harness that drives the child over side-channel descriptors (socketpairs, pipes, event channels) cannot reach them under supervision. With this flag the named descriptor stays open in the sandboxed process at the same fd number. Repeatable, one descriptor per flag.
+
+The descriptor must already be open in the nono process when it starts: requests for stdio numbers (0/1/2) or closed descriptors are rejected before launch.
+
+```bash
+# pass the socketpair endpoint the harness opened as fd 3
+nono run --allow-cwd --allow-inherit-fd 3 -- my-harness --fd 3
+```
+
+<Warning>
+  An inherited descriptor bypasses nono's capture and network mediation for its whole lifetime: sandboxed code holding an already-open socket fd can use it without a fresh `connect()`, so the traffic never flows through the credential proxy or appears in the audit trail. Only pass descriptors you intend the sandboxed process to own.
+</Warning>
+
 #### `--dry-run`
 
 Show what capabilities would be granted without actually executing the command or applying the sandbox.

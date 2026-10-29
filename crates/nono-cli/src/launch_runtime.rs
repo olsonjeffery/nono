@@ -260,6 +260,9 @@ pub(crate) struct ExecutionFlags {
     pub(crate) case_insensitive_env_vars: bool,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
+    /// Parent-provided descriptors to keep open in the supervised child
+    /// (`--allow-inherit-fd`). Empty by default.
+    pub(crate) allow_inherit_fds: Vec<i32>,
     pub(crate) startup_timeout_secs: Option<u64>,
     /// Resolved budget for recording denied network syscalls individually
     /// (CLI flag, then profile, then default).
@@ -329,6 +332,7 @@ impl ExecutionFlags {
             denied_env_vars: prepared.denied_env_vars.clone(),
             case_insensitive_env_vars: prepared.case_insensitive_env_vars,
             set_vars: prepared.set_vars.clone(),
+            allow_inherit_fds: Vec::new(),
             startup_timeout_secs: None,
             network_denial_audit: crate::profile::NetworkDenialAuditLimits::resolve(
                 prepared.network_denial_audit,
@@ -480,6 +484,7 @@ pub(crate) fn prepare_run_launch_plan(
         trust,
         network,
         startup_timeout_secs,
+        allow_inherit_fds: run_args.allow_inherit_fd.clone(),
         network_denial_audit: crate::profile::NetworkDenialAuditLimits::resolve(
             prepared.network_denial_audit,
             run_args.network_denial_audit_rate,
@@ -751,6 +756,7 @@ mod tests {
             rollback_include: Vec::new(),
             rollback_all: false,
             skip_dir: Vec::new(),
+            allow_inherit_fd: Vec::new(),
             rollback_dest: None,
             no_diagnostics: false,
             diagnostics_json: false,

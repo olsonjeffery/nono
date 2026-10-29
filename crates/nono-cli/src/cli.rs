@@ -2007,6 +2007,17 @@ pub struct RunArgs {
     #[arg(long, value_name = "DIR_NAME", help_heading = "OPTIONS")]
     pub skip_dir: Vec<String>,
 
+    /// Pass a parent-provided file descriptor through to the supervised command.
+    /// By default `nono run` closes every descriptor above stdio (0/1/2) so no
+    /// untracked handle survives into the sandbox. With this flag the named
+    /// descriptor stays open in the sandboxed process at the same number.
+    /// CAUTION: an inherited descriptor bypasses nono's session capture and
+    /// network mediation for its whole lifetime; only pass descriptors you
+    /// intend the sandboxed process to own. stdio stays inherited regardless.
+    /// Repeatable, one descriptor per flag.
+    #[arg(long = "allow-inherit-fd", value_name = "FD", help_heading = "OPTIONS")]
+    pub allow_inherit_fd: Vec<i32>,
+
     /// Override the rollback snapshot destination directory.
     /// By default, snapshots are stored in $XDG_STATE_HOME/nono/rollbacks/.
     /// The destination must be within a path already granted write access

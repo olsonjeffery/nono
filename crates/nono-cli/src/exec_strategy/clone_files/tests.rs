@@ -76,6 +76,7 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
         case_insensitive_env_vars: false,
         set_vars: vec![],
         tool_sandbox_runtime: None,
+        allow_inherit_fds: vec![],
     }
 }
 
@@ -233,6 +234,7 @@ fn run(
             supervisor_fd,
             pty_slave: pty,
             resource_procs: resource,
+            inherited_fds: &[],
             fault,
         },
         config.caps,
@@ -412,6 +414,7 @@ fn failure_cleanup() -> Result<()> {
                 supervisor_fd: None,
                 pty_slave: None,
                 resource_procs: None,
+                inherited_fds: &[],
                 fault: Fault::None,
             },
             &caps,

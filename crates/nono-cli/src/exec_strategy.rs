@@ -33,8 +33,7 @@ use nono::{
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
-use std::os::fd::FromRawFd;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -336,6 +335,14 @@ pub struct ExecConfig<'a> {
     /// and an additional Linux execute-only Landlock gate.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub tool_sandbox_runtime: Option<&'a crate::tool_sandbox::PreparedToolSandboxRuntime>,
+    /// Parent-provided descriptors that survive into the supervised child.
+    /// Empty by default: the child's descriptor table is otherwise swept down
+    /// to stdio plus nono's own plumbing at exec. Opt-in per descriptor number
+    /// (`--allow-inherit-fd`); every requested fd is validated as open here,
+    /// in the parent, before fork. A held descriptor bypasses network
+    /// mediation for its whole lifetime — keep this list to what the harness
+    /// explicitly handed over.
+    pub allow_inherit_fds: Vec<RawFd>,
 }
 
 #[derive(Clone, Copy)]
@@ -937,6 +944,11 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // reattached independently of capability elevation.
     let pty_slave_fd = pty_pair.as_ref().map(|p| p.slave.as_raw_fd());
 
+    // Validate parent-provided inheritable descriptors before forking: the
+    // post-fork child may not inspect or allocate (legacy fork), and the
+    // CLONE_FILES bootstrap child must not allocate at all.
+    let allow_inherit_fds = validate_allow_inherit_fds(&config.allow_inherit_fds)?;
+
     // Compute child's FD keep list: PTY slave (if elevation) + supervisor socket fd
     let mut child_keep_fds: Vec<i32> = Vec::new();
     if let Some(fd) = pty_slave_fd {
@@ -945,6 +957,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     if let Some(fd) = child_sock_fd {
         child_keep_fds.push(fd);
     }
+    child_keep_fds.extend(allow_inherit_fds.iter().copied());
 
     // Compute max FD in parent (get_max_fd may allocate on Linux)
     let max_fd = get_max_fd();
@@ -989,6 +1002,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 supervisor_fd: child_sock_fd,
                 pty_slave: pty_slave_fd,
                 resource_procs: resource_procs_fd,
+                inherited_fds: &allow_inherit_fds,
                 #[cfg(test)]
                 fault: clone_files::Fault::None,
             },
@@ -1317,7 +1331,31 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 }
             }
 
-            // Close inherited FDs (but keep stdin/stdout/stderr and supervisor socket)
+            // Parent-provided descriptors are keep-listed; clear their
+            // close-on-exec bit so execve preserves them. A descriptor that
+            // vanished between validation and here cannot leak anything, so
+            // skip it; any other failure is fatal — never exec unconfined.
+            for fd in &allow_inherit_fds {
+                // SAFETY: scalar descriptor syscalls, no allocation.
+                if unsafe { libc::fcntl(*fd, libc::F_GETFD) } < 0 {
+                    continue;
+                }
+                if unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) } < 0 {
+                    const MSG: &[u8] = b"nono: failed to clear close-on-exec on inherited fd\n";
+                    // SAFETY: async-signal-safe write on the post-fork child path.
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            MSG.as_ptr().cast::<libc::c_void>(),
+                            MSG.len(),
+                        );
+                        libc::_exit(126);
+                    }
+                }
+            }
+
+            // Close inherited FDs (but keep stdin/stdout/stderr, the supervisor
+            // socket, and the --allow-inherit-fd list)
             close_inherited_fds(max_fd, &child_keep_fds);
 
             if !chdir_before_sandbox {
@@ -2067,6 +2105,35 @@ fn close_inherited_fds(max_fd: i32, keep_fds: &[i32]) {
             unsafe { libc::close(fd) };
         }
     }
+}
+
+/// Validate `--allow-inherit-fd` requests for the supervised child.
+///
+/// Each requested number must be above stdio (0/1/2 are always passed
+/// through) and must currently be open in this process: a number that names
+/// no descriptor is a caller bug, not a launch condition. Returns the
+/// numbers deduplicated and ordered; both exec paths (the legacy fork sweep
+/// and the CLONE_FILES bootstrap scrub) treat the validated list as the
+/// keep-set.
+fn validate_allow_inherit_fds(requested: &[RawFd]) -> Result<Vec<RawFd>> {
+    let mut fds: Vec<RawFd> = requested.to_vec();
+    fds.sort_unstable();
+    fds.dedup();
+    for fd in &fds {
+        if *fd < 3 {
+            return Err(NonoError::SandboxInit(format!(
+                "--allow-inherit-fd {fd}: stdio (0/1/2) is always passed through; only request descriptors above stdio"
+            )));
+        }
+        // SAFETY: F_GETFD takes only a descriptor scalar and reports EBADF
+        // for closed entries; no allocation, no pointers.
+        if unsafe { libc::fcntl(*fd, libc::F_GETFD) } < 0 {
+            return Err(NonoError::SandboxInit(format!(
+                "--allow-inherit-fd {fd}: descriptor {fd} is not open in the nono process, so there is nothing to inherit"
+            )));
+        }
+    }
+    Ok(fds)
 }
 
 /// Get the maximum file descriptor number to iterate over.
@@ -6566,5 +6633,95 @@ mod orphan_reap_tests {
                 );
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod inherit_fd {
+    use super::*;
+
+    fn launch(path: &str, test: impl FnOnce() -> Result<()>) -> Result<()> {
+        if std::env::var("NONO_INHERIT_FD_TEST").ok().as_deref() == Some(path) {
+            return test();
+        }
+        let executable = std::env::current_exe().map_err(NonoError::Io)?;
+        let mut child = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                &format!("exec_strategy::inherit_fd::{path}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("NONO_INHERIT_FD_TEST", path)
+            .spawn()
+            .map_err(NonoError::Io)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(status) = child.try_wait().map_err(NonoError::Io)? {
+                assert!(status.success(), "isolated {path}: {status}");
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                child.kill().map_err(NonoError::Io)?;
+                child.wait().map_err(NonoError::Io)?;
+                return Err(NonoError::SandboxInit(format!("isolated {path} timed out")));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Duplicate `source` to the lowest free number above stdio, with
+    /// close-on-exec set — so the child's clearing step is exercised.
+    fn duplicate_above_stdio(source: RawFd) -> Result<OwnedFd> {
+        // SAFETY: source is an open owned descriptor; F_DUPFD_CLOEXEC returns
+        // a fresh owned one.
+        let duplicate = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(NonoError::SandboxInit(
+                "cannot duplicate test descriptor".to_string(),
+            ));
+        }
+        // SAFETY: checked fresh owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+    }
+
+    fn open_marker(directory: &tempfile::TempDir) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(directory.path().join("marker"))
+            .map_err(NonoError::Io)
+    }
+
+    #[test]
+    fn validate_allow_inherit_fds_checks_descriptors() {
+        launch("validate_allow_inherit_fds_checks_descriptors", || {
+            // stdio numbers (0/1/2) and negatives never qualify.
+            for fd in [0_i32, 1, 2, -1] {
+                assert!(
+                    validate_allow_inherit_fds(&[fd]).is_err(),
+                    "fd {fd} must be rejected"
+                );
+            }
+            // An open descriptor validates, dedupes and ordering holds.
+            let directory = tempfile::tempdir().map_err(NonoError::Io)?;
+            let file = open_marker(&directory)?;
+            let inherited = duplicate_above_stdio(file.as_raw_fd())?;
+            let fd = inherited.as_raw_fd();
+            let validated = validate_allow_inherit_fds(&[fd, fd])?;
+            assert_eq!(validated, vec![fd]);
+            // A released descriptor number fails validation instead of being
+            // silently ignored.
+            let released = fd;
+            drop(inherited);
+            assert!(
+                validate_allow_inherit_fds(&[released]).is_err(),
+                "released fd {released} must be rejected"
+            );
+            Ok(())
+        })
+        .expect("validate_allow_inherit_fds_checks_descriptors");
     }
 }
